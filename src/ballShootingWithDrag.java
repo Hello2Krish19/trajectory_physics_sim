@@ -10,7 +10,8 @@ public class ballShootingWithDrag {
  static final double EPS = 1e-8;
 
  // spin vector (rad/s) in world frame
- Vector3 omega = new Vector3(0, 10.0, 0); 
+ // omega.y flipped so backspin on a +X shot gives +Z lift (was downward before)
+ Vector3 omega = new Vector3(0, -10.0, 0); 
 
  
  static Vector3 dragForce(Vector3 v_rel) {
@@ -35,6 +36,8 @@ public class ballShootingWithDrag {
  }
 
  // acceleration including gravity
+ // v_robot is the shooter's velocity (used at launch in solveShot). Wind is zero, so
+ // air-relative velocity for drag/Magnus is the ball's world velocity.
  Vector3 acceleration(Vector3 v_world, Vector3 v_robot, Vector3 omega) {
 	 
      Vector3 v_rel = v_world; 
@@ -87,6 +90,7 @@ public class ballShootingWithDrag {
      double maxT = 5.0; // safety
      double bestDist = Double.POSITIVE_INFINITY;
      State bestState = null;
+     double bestTime = 0;
      
      double prevZ = initialPos.z;
      
@@ -95,11 +99,12 @@ public class ballShootingWithDrag {
          // update best distance
          double dist = s.p.subtract(hubPos).magnitude();
          if (dist < bestDist) { 
-        	 	bestDist = dist; bestState = new State(s.p.clone(), s.v.clone()); 
+        	 	bestDist = dist; bestState = new State(s.p.clone(), s.v.clone());
+        	 	bestTime = t;
         	 }
          // if ball passed hub Z going downward and horizontal beyond hub plane, optional rules
          // We'll stop if the ball is below hubZ - 0.5 and descending
-         if (s.p.z < -1.0) break; // hit floor
+         if (s.p.z < 0) break; // hit floor (z=0 ground; was z<-1 which let it go underground)
          // stop if ball has traveled over 100 meters
          if (Math.hypot(s.p.x - initialPos.x, s.p.y - initialPos.y) > 100.0) break;
 
@@ -109,19 +114,37 @@ public class ballShootingWithDrag {
 
          if ((s.p.z - hubPos.z) < 0 && (prevZ - hubPos.z) > 0) {
             //crossed hub. If this triggers on the descending, we should break since we've already gone under the hub.
-        	 	break;
+            // but only if we've actually reached the target in XY — otherwise a lob still short of the hub gets cut off
+            double dTarget = Math.hypot(hubPos.x - initialPos.x, hubPos.y - initialPos.y);
+            double along = 0;
+            if (dTarget > EPS) {
+                along = ((s.p.x - initialPos.x) * (hubPos.x - initialPos.x)
+                       + (s.p.y - initialPos.y) * (hubPos.y - initialPos.y)) / dTarget;
+            }
+        	 	if (along >= dTarget) break;
          }
          prevZ = s.p.z;  // update previous z
      }
      // return best distance and state when closest
-     return new SimulationResult(bestDist, bestState, t);
+     return new SimulationResult(bestDist, bestState, bestTime);
  }
 
 
  ShotSolution solveShot(Vector3 shooterPos, Vector3 hubPos, Vector3 v_robot, int angleSamples) {
-     double heading = Math.atan2(hubPos.y - shooterPos.y, hubPos.x - shooterPos.x);
+     double baseHeading = Math.atan2(hubPos.y - shooterPos.y, hubPos.x - shooterPos.x);
+
+     // with spin the ball curves, so try a few heading offsets around atan2; no spin => just the original heading
+     int headingSamples = 1;
+     double headingSpan = Math.toRadians(20.0);
+     if (omega.magnitude() > 1e-8) headingSamples = 11;
 
      ShotSolution best = null;
+     for (int h = 0; h < headingSamples; ++h) {
+         double heading = baseHeading;
+         if (headingSamples > 1) {
+             heading = baseHeading - headingSpan + 2.0 * headingSpan * h / (headingSamples - 1);
+         }
+
      for (int i = 0; i < angleSamples; ++i) {
          double frac = (i + 0.5) / angleSamples;
          // sample angle range 5 to 75 degrees (in radians)
@@ -138,34 +161,39 @@ public class ballShootingWithDrag {
             		 						 vMid * Math.sin(theta));
              Vector3 vel = vRobot.add(v_robot); //my naming conventions are perfect. this is the velocity of the ball relative to the world
              //System.out.println("vel magnitude: " + vel.magnitude() +" v_robot magnitude: " + v_robot.magnitude() + " vRobot.magintude: " + vRobot.magnitude());
-             //^ also im not sure if I was supposed to add or subtract there
+             //^ add: world vel = muzzle (vRobot) + robot vel. drag uses world vel (zero wind)
              SimulationResult res = simulate(shooterPos, vel, hubPos, v_robot);
              
             // System.out.printf("theta=%.2f deg, v=%.2f m/s, closestDist=%.3f m\n", Math.toDegrees(theta), vMid, res.closestDistance);
              
              double err = res.closestDistance;
              double dTarget = Math.hypot(hubPos.x - shooterPos.x, hubPos.y - shooterPos.y);
-             double dAtClosest = Math.hypot(res.bestState.p.x - shooterPos.x, res.bestState.p.y - shooterPos.y);
-             if (Math.abs(err) < 0.20) { // tolerance 20 cm feels fair. Idk how big the hub is I forgor
+             // along-track XY progress toward the hub (not 3D hypot of closest point — that breaks on lobs)
+             double dAtClosest = 0;
+             if (dTarget > EPS && res.bestState != null) {
+                 dAtClosest = ((res.bestState.p.x - shooterPos.x) * (hubPos.x - shooterPos.x)
+                             + (res.bestState.p.y - shooterPos.y) * (hubPos.y - shooterPos.y)) / dTarget;
+             }
 
-                 double wheelSpeedNeeded = vRobot.magnitude(); 
-                 //what speed does the flywheel need to be to shoot the ball at the correct vRobot to reach the correct vel? 
-                 ShotSolution sol = new ShotSolution(theta, vel.magnitude(), heading, wheelSpeedNeeded, err);
-                 if (best == null || sol.err < best.err) best = sol;
+             double wheelSpeedNeeded = vRobot.magnitude(); 
+             //what speed does the flywheel need to be to shoot the ball at the correct vRobot to reach the correct vel? 
+             ShotSolution sol = new ShotSolution(theta, vel.magnitude(), heading, wheelSpeedNeeded, err);
+             if (best == null || sol.err < best.err) best = sol;
+
+             if (Math.abs(err) < 0.20) { // tolerance 20 cm feels fair. Idk how big the hub is I forgor
                  break; // we did it once
              }
              // reset bounds of the binary search
-             //if the shot falls short (peak horizontal distance < hub horizontal distance), increase speed
+             //if the shot falls short (along-track distance < hub horizontal distance), increase speed
              if (dAtClosest < dTarget) {
                  vLow = vMid;
              } else {
                  vHigh = vMid;
              }
          } 
+     }
      } 
 
      return best;
  }
 }
-
-
